@@ -1,6 +1,6 @@
 # bumblebee_methylation_colony
 
-**Lead:** Christian Thscriptomas   
+**Lead:** Christian Thomas   
 **PI:** Eamonn Mallon | University of Leicester  
 **Status:** Active  
 
