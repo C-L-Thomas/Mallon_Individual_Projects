@@ -1,0 +1,281 @@
+library(data.table)
+library(dendextend)
+library(sna)
+
+input_dir <- "/data/monoallelic/christian/Bee_data/Stranded/Reverted"
+output_dir <- "/scratch/monoallelic/clt54/Bee/Relatedness/New_Spearmans"
+
+# Load Methylation Files
+
+files <- list.files(
+  input_dir,
+  "_binomial_results\\.txt$",
+  full.names = TRUE
+)
+
+tables <- lapply(files, function(file) {
+  
+  sample_name <- basename(file)
+  sample_name <- sub("_binomial_results\\.txt$", "", sample_name)
+  
+  sample_data <- fread(file)
+  
+  sample_data[, methylation := 100 * C / total]
+  sample_data[total == 0, methylation := NA_real_]
+  
+  sample_data <- sample_data[
+    , .(chr, pos, strand, methylation)
+  ]
+  
+  setnames(sample_data, "methylation", sample_name)
+  
+  return(sample_data)
+})
+
+combined <- Reduce(
+  function(x, y) merge(x, y, by = c("chr", "pos", "strand"), all = TRUE),
+  tables
+)
+
+samples <- setdiff(names(combined), c("chr", "pos", "strand"))
+matrix_all <- as.matrix(combined[, ..samples])
+
+#Filtering
+
+combined[, samples_covered := rowSums(!is.na(matrix_all))]
+combined[, variability_sd := apply(matrix_all, 1, sd, na.rm = TRUE)] #Identify standard deviation
+
+minimum_samples <- ceiling(length(samples) * 0.75) #Identifies rows with <75% coverage
+
+variable_cpgs <- combined[
+  samples_covered >= minimum_samples & variability_sd > 0
+]
+
+fwrite(
+  variable_cpgs,
+  file.path(output_dir, "combined_variable_CpGs_min75pct_samples.tsv"),
+  sep = "\t"
+)
+
+# Create Correlation Tree
+
+methylation_matrix <- as.matrix(variable_cpgs[, ..samples])
+
+methylation_correlation <- cor(
+  methylation_matrix,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+
+fwrite(
+  as.data.table(methylation_correlation, keep.rownames = "sample"),
+  file.path(output_dir, "sample_methylation_correlations.tsv"),
+  sep = "\t"
+)
+
+#Methylation Higherarchial cluster
+
+methylation_tree <- hclust(
+  as.dist(1 - methylation_correlation),
+  method = "average"
+)
+
+methylation_dendrogram <- as.dendrogram(methylation_tree)
+
+methylation_colonies <- sub(
+  "^(N[0-9]+).*",
+  "\\1",
+  labels(methylation_dendrogram)
+)
+
+colony_colours <- c(
+  N1 = "#D73027",
+  N3 = "#B79F00",
+  N4 = "#00BA38",
+  N6 = "#00BFC4",
+  N7 = "#619CFF",
+  N8 = "#F564E3"
+)
+
+labels_colors(methylation_dendrogram) <- colony_colours[methylation_colonies]
+labels_cex(methylation_dendrogram) <- 1
+
+###############################################################################################
+########################### Read in Genetic data ######################################
+
+relationship_matrix <- as.matrix(
+  fread(
+    file.path(output_dir, "bombus_relationship.rel"),
+    header = FALSE
+  )
+)
+storage.mode(relationship_matrix) <- "numeric"
+
+#Read sample ID
+id_lines <- readLines(
+  file.path(output_dir, "bombus_relationship.rel.id")
+)
+relationship_ids <- sub("_1$", "", trimws(id_lines[-1]))
+
+rownames(relationship_matrix) <- relationship_ids
+colnames(relationship_matrix) <- relationship_ids
+
+#Genetic higherarchial cluster
+genetic_tree <- hclust(
+  as.dist(1 - relationship_matrix),
+  method = "average"
+)
+
+genetic_dendrogram <- as.dendrogram(genetic_tree)
+
+genetic_colonies <- sub(
+  "^(N[0-9]+).*",
+  "\\1",
+  labels(genetic_dendrogram)
+)
+
+labels_colors(genetic_dendrogram) <- colony_colours[genetic_colonies]
+labels_cex(genetic_dendrogram) <- 1
+
+###########################
+# Draw Images 
+
+png(
+  file.path(output_dir, "methylation_and_genetic_trees.png"),
+  width = 4250, height = 2000, res = 250
+)
+
+layout(matrix(1:3, nrow = 1), widths = c(1, 1, 0.12))
+par(mar = c(7, 5, 3, 1), cex.axis = 1.2,
+    cex.lab = 1.3, cex.main = 1.3)
+
+plot(
+  methylation_dendrogram,
+  main = "A  Methylation similarity",
+  ylab = "Distance (1 - Spearman correlation)"
+)
+
+plot(
+  genetic_dendrogram,
+  main = "B  Genetic relationship",
+  ylab = "Distance (1 - genetic relationship)"
+)
+
+par(mar = c(0, 0, 0, 0))
+plot.new()
+legend(
+  "center", names(colony_colours),
+  col = colony_colours, pch = 16,
+  title = "Colony", bty = "n", cex = 1.2
+)
+
+dev.off()
+
+#######################################################
+# QAP
+
+# Put both matrices in the same sample order
+sample_order <- rownames(methylation_correlation)
+
+stopifnot(
+  setequal(sample_order, rownames(relationship_matrix)),
+  setequal(sample_order, colnames(relationship_matrix))
+)
+
+relationship_matrix <- relationship_matrix[
+  sample_order, sample_order
+]
+
+# Colony assignments, including the four swaps
+colonies <- sub("^(N[0-9]+).*", "\\1", sample_order)
+names(colonies) <- sample_order
+
+colonies[c("N6B3-3", "N6B3-4")] <- "N7"
+colonies[c("N7B2-1", "N7B2-2")] <- "N6"
+
+same_colony <- outer(
+  colonies[sample_order],
+  colonies[sample_order],
+  "=="
+)
+storage.mode(same_colony) <- "numeric"
+
+# Unadjusted QAP
+set.seed(123)
+
+qap_unadjusted <- netlm(
+  y = methylation_correlation,
+  x = relationship_matrix,
+  intercept = TRUE,
+  mode = "graph",
+  diag = FALSE,
+  nullhyp = "qap",
+  test.statistic = "t-value",
+  reps = 9999
+)
+
+capture.output(
+  summary(qap_unadjusted),
+  file = file.path(output_dir, "qap_unadjusted.txt")
+)
+
+# QAP adjusted for the swapped colony assignments
+predictors <- array(
+  NA_real_,
+  dim = c(2, length(sample_order), length(sample_order))
+)
+
+predictors[1, , ] <- relationship_matrix
+predictors[2, , ] <- same_colony
+
+set.seed(123)
+
+qap_swapped <- netlm(
+  y = methylation_correlation,
+  x = predictors,
+  intercept = TRUE,
+  mode = "graph",
+  diag = FALSE,
+  nullhyp = "qapspp",
+  test.statistic = "t-value",
+  reps = 9999
+)
+
+capture.output(
+  summary(qap_swapped),
+  file = file.path(output_dir, "qap_colony_adjusted_swapped.txt")
+)
+
+##################################################################
+# QAP Image
+
+pairs <- which(upper.tri(methylation_correlation), arr.ind = TRUE)
+
+genetic_values <- relationship_matrix[pairs]
+methylation_values <- methylation_correlation[pairs]
+same_colony_pairs <- same_colony[pairs] == 1
+
+png(
+  file.path(output_dir, "qap_relationship_vs_methylation.png"),
+  width = 1800, height = 1500, res = 250
+)
+
+plot(
+  genetic_values,
+  methylation_values,
+  pch = 16,
+  col = ifelse(same_colony_pairs, "#D7302780", "#619CFF80"),
+  xlab = "Genetic relationship",
+  ylab = "Spearman methylation similarity",
+  cex = 1.1
+)
+
+legend(
+  "topleft",
+  c("Same colony (swapped assignment)", "Different colonies"),
+  col = c("#D73027", "#619CFF"),
+  pch = 16,
+  bty = "n"
+)
+
+dev.off()
