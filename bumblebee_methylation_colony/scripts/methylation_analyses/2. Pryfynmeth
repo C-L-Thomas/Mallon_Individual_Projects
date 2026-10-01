@@ -1,0 +1,7 @@
+python pryfynmeth/bisulphite_preprocessing.py -i Input -o all_Input -type stranded --output_type all
+
+python pryfynmeth/binomial.py -meta metadata.txt -platform illu -i all_Input -o Binomial_output
+
+python pryfynmeth/filter.py  -i Binomial_output -f output_adjusted_sites -m output_pass_binomial -s output_shared_sites -threshold 10 -r reverted_folder
+
+python pryfynmeth/dss_prepare.py -i reverted_folder -o DSS_folder
