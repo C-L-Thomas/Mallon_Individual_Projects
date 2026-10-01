@@ -1,0 +1,941 @@
+library(DSS)
+library(readr)
+library(data.table)
+library(rtracklayer)
+library(topGO)
+library(GO.db)
+library(bsseq)
+library(ggplot2)
+library(rrvgo)
+library("org.Dm.eg.db")
+library(UpSetR)
+
+################################ Preamble ################################
+
+in_dir <- "." 		#Setwd
+out_prefix <- "DSS"	#Set prefix
+fdr_thresh <- 0.05	#Set FDR threshold
+nodeSize <- 5
+
+#Load Files
+gene_anno_file <- "/Genomes/Bombus_terrestris/genes_with_start_and_end.txt"	#File stating gene start and end
+gff_file       <- "/Genomes/Bombus_terrestris/GCF_910591885.1_iyBomTerr1.2_genomic.gff"	#gff
+go_map_file       <- "/Genomes/Bombus_terrestris/BomTerr1.2_Eggnog_go_map.tsv"	#Go terms
+treemap_orgdb <- "org.Dm.eg.db"
+
+contrast_names <- c("Control_vs_5aza", "Control_vs_6aza", "5aza_vs_6aza", "repro_vs_sterile")
+
+# Find input files and sort them into the order in which they will be read
+
+file.list <- sort(list.files(
+  path = in_dir,
+  pattern = "binomial_results\\.txt$",
+  full.names = TRUE ))
+
+# Metadata in the same initial order as the sorted input files
+
+Drug <- rep(c("5aza", "5aza", "Control", "Control", "6aza", "6aza"), 6)
+Colony <- rep(c("1", "3", "4", "6", "7", "8"),each = 6)
+
+Status <- c("sterile", "repro", "sterile", "repro", "repro", "sterile",
+  "sterile", "repro", "sterile", "repro", "sterile", "repro",
+  "repro", "sterile", "sterile", "repro", "repro", "sterile",
+  "sterile", "repro", "repro", "sterile", "sterile", "repro",
+  "sterile", "repro", "sterile", "repro", "repro", "sterile",
+  "repro", "sterile", "sterile", "repro", "sterile", "repro")
+
+# Combine the filenames and metadata in reading order
+metadata <- data.frame(
+  Input_file = basename(file.list),
+  Colony = Colony,
+  Drug = Drug,
+  Reproductive_status = Status,
+  stringsAsFactors = FALSE
+)
+
+# Reassign control samples whose genomic clustering indicated that the original colony 6 and colony 7 labels were reversed
+control_colony6 <- metadata$Drug == "Control" & metadata$Colony == "6"
+control_colony7 <- metadata$Drug == "Control" & metadata$Colony == "7"
+
+metadata$Colony[control_colony6] <- "7"
+metadata$Colony[control_colony7] <- "6"
+
+# Generate a unique BSseq sample name
+
+metadata$Sample_name <- paste(
+  "Col", metadata$Colony, 
+  metadata$Drug,
+  metadata$Reproductive_status, 
+  seq_len(nrow(metadata)),
+  sep = "_"
+)
+
+# Print metadata in the exact order in which files will be read
+
+cat("\n================ SAMPLE METADATA ================\n")
+
+print(metadata, row.names = FALSE)
+
+cat("=================================================\n\n")
+
+# Read and format DSS input files
+samples <- lapply(file.list, function(input_file) {
+  
+  message("Reading: ", basename(input_file))
+  
+  dat <- fread(input_file)
+  setnames(dat, c("C", "total"), c("X", "N"))
+  
+  dat <- dat[, .(
+    chr = as.character(chr),
+    pos = as.integer(pos),
+    N   = as.integer(N),
+    X   = as.integer(X)
+  )]
+  
+  as.data.frame(dat)
+})
+
+# Create the BSseq object
+
+BSobj <- makeBSseqData(dat = samples,sampleNames = metadata$Sample_name)
+
+# Construct the model design
+design <- data.frame(
+  Drug   = factor(metadata$Drug),
+  Colony = factor(metadata$Colony),
+  Status = factor(metadata$Reproductive_status)
+)
+
+# Print the final correspondence between input files and the DSS design
+
+final_metadata <- data.frame(
+  Input_file = metadata$Input_file,
+  BSseq_sample = sampleNames(BSobj),
+  Colony = design$Colony,
+  Drug = design$Drug,
+  Reproductive_status = design$Status
+)
+
+cat("\n================ FINAL DSS METADATA =============\n")
+print(final_metadata, row.names = FALSE)
+cat("=================================================\n\n")
+
+################################ PCA ################################
+
+meth <- getMeth(BSobj, type = "raw")
+
+# Retain complete, variable CpGs
+meth_filt <- meth[complete.cases(meth), , drop = FALSE]
+meth_filt <- meth_filt[apply(meth_filt, 1, sd) > 0, , drop = FALSE]
+
+pca <- prcomp(t(meth_filt), scale. = TRUE)
+var_exp <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+df <- data.frame(
+  pca$x,
+  sample = colnames(meth_filt),
+  Drug = factor(design$Drug, levels = c("Control", "5aza", "6aza")),
+  Colony = design$Colony,
+  Status = factor(design$Status, levels = c("sterile", "repro"))
+)
+
+# plot
+p <- ggplot(
+  df,
+  aes(PC1, PC2, color = Colony, shape = Drug, fill = Status)
+) +
+  geom_point(size = 4, stroke = 1.2) +
+  scale_shape_manual(
+    values = c("Control" = 24, "5aza" = 21, "6aza" = 22)
+  ) +
+  scale_fill_manual(
+    values = c("sterile" = "white", "repro" = "black")
+  ) +
+  guides(
+    fill = guide_legend(
+      override.aes = list(shape = 21, color = "black")
+    )
+  ) +
+  labs(
+    x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
+    y = paste0("PC2 (", round(var_exp[2], 1), "%)"),
+    color = "Colony",
+    shape = "Drug",
+    fill = "Status"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+ggsave("pca_plot.png", p, width = 7, height = 5, dpi = 300)
+
+################################ Models ################################
+design$Status <- relevel(design$Status, ref="sterile")
+
+#Model A
+designA <- copy(design)
+designA$Drug <- relevel(designA$Drug, ref="Control") #Set reference
+fitA <- DMLfit.multiFactor(BSobj, design=designA, formula=~Drug + Status + Colony) #Run model
+
+#Reproductive status
+dms_repro <- DMLtest.multiFactor(fitA, coef="Statusrepro") #Perform Wald tests
+dms_repro_dt <- as.data.table(dms_repro)
+setnames(dms_repro_dt, "fdrs", "fdr")
+dms_repro_sig <- dms_repro_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites 
+dms_repro_sig[, contrast := "repro_vs_sterile"]
+fwrite(dms_repro_sig, paste0(out_prefix, "_repro_vs_sterile_sigCpGs.tsv"), sep="\t") #Write results
+
+
+#Control vs 6aza
+dms_6aza_ctl <- DMLtest.multiFactor(fitA, coef="Drug6aza") #Perform Wald tests
+dms_6aza_ctl_dt <- as.data.table(dms_6aza_ctl)
+setnames(dms_6aza_ctl_dt, "fdrs", "fdr")
+dms_6aza_ctl_dt[, stat := -stat] # Convert 6aza - Control to Control - 6aza
+dms_ctl_6aza_sig <- dms_6aza_ctl_dt[!is.na(fdr) & fdr < fdr_thresh]
+dms_ctl_6aza_sig[, contrast := "Control_vs_6aza"]
+fwrite(dms_ctl_6aza_sig, paste0(out_prefix, "_Control_vs_6aza_sigCpGs.tsv"), sep="\t") #Write results
+
+#Colony
+dms_colony <- DMLtest.multiFactor(fitA, term="Colony") #multi-degree-of-freedom Wald test across all colony levels
+dms_colony_dt <- as.data.table(dms_colony)
+setnames(dms_colony_dt, "pvals", "pval")
+dms_colony_dt[, fdr := p.adjust(pval, method = "BH")] #Need to perform fdr because of multi-degree freedom wald test
+dms_colony_sig <- dms_colony_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites
+dms_colony_sig[, contrast := "Colony_effect"]
+fwrite(dms_colony_sig, paste0(out_prefix, "_Colony_effect_sigCpGs.tsv"), sep = "\t") #Write results
+
+
+#Model B: 5aza reference
+designB <- copy(design)
+designB$Drug <- relevel(designB$Drug, ref="5aza")
+fitB <- DMLfit.multiFactor(BSobj, design=designB, formula=~Drug + Status + Colony)
+
+# Control vs 5aza
+dms_ctl_5aza <- DMLtest.multiFactor(fitB, coef="DrugControl") #Perform Wald tests
+dms_ctl_5aza_dt <- as.data.table(dms_ctl_5aza)
+setnames(dms_ctl_5aza_dt, "fdrs", "fdr")
+dms_ctl_5aza_sig <- dms_ctl_5aza_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites
+dms_ctl_5aza_sig[, contrast := "Control_vs_5aza"]
+fwrite(dms_ctl_5aza_sig, paste0(out_prefix, "_Control_vs_5aza_sigCpGs.tsv"), sep="\t") #Write results
+
+#  6aza vs 5aza
+dms_6aza_5aza <- DMLtest.multiFactor(fitB, coef="Drug6aza") #Perform Wald tests
+dms_6aza_5aza_dt <- as.data.table(dms_6aza_5aza)
+setnames(dms_6aza_5aza_dt, "fdrs", "fdr")
+dms_6aza_5aza_dt[, stat := -stat] # Convert 6aza - 5aza to 5aza - 6aza
+dms_5aza_6aza_sig <- dms_6aza_5aza_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites
+dms_5aza_6aza_sig[, contrast := "5aza_vs_6aza"]
+fwrite(dms_5aza_6aza_sig, paste0(out_prefix, "_5aza_vs_6aza_sigCpGs.tsv"), sep="\t") #Write results
+cat("[5aza_vs_6aza] sig CpGs:", nrow(dms_5aza_6aza_sig), "\n")
+
+saveRDS(dms_repro_dt, file = "dms_repro_dt.rds")
+saveRDS(dms_6aza_ctl_dt, file = "dms_ctl_6aza_dt.rds")
+saveRDS(dms_colony_dt, file = "dms_colony_dt.rds")
+saveRDS(dms_ctl_5aza_dt, file = "dms_ctl_5aza_dt.rds")
+saveRDS(dms_6aza_5aza_dt, file = "dms_5aza_6aza_dt.rds")
+
+# Summarise significant hyper- and hypomethylated CpGs
+direction_summary <- data.table(
+  contrast = contrast_names,
+  hyper = c(
+    sum(dms_ctl_5aza_sig$stat > 0, na.rm = TRUE),
+    sum(dms_ctl_6aza_sig$stat > 0, na.rm = TRUE),
+    sum(dms_5aza_6aza_sig$stat > 0, na.rm = TRUE),
+    sum(dms_repro_sig$stat > 0, na.rm = TRUE)
+  ),
+  hypo = c(
+    sum(dms_ctl_5aza_sig$stat < 0, na.rm = TRUE),
+    sum(dms_ctl_6aza_sig$stat < 0, na.rm = TRUE),
+    sum(dms_5aza_6aza_sig$stat < 0, na.rm = TRUE),
+    sum(dms_repro_sig$stat < 0, na.rm = TRUE)
+  ),
+  total_sig = c(
+    nrow(dms_ctl_5aza_sig),
+    nrow(dms_ctl_6aza_sig),
+    nrow(dms_5aza_6aza_sig),
+    nrow(dms_repro_sig)
+  )
+)
+
+print(direction_summary)
+
+fwrite(
+  direction_summary,
+  paste0(out_prefix, "_direction_summary.tsv"),
+  sep = "\t"
+)
+
+################################ Assign CpGs to Genes ################################
+
+genes <- fread(gene_anno_file) #Read gene regions file
+
+genes[, `:=`(chr= as.character(chr),
+  start = as.integer(start),
+  end   = as.integer(end),
+  geneID = sub("^gene-", "", as.character(geneID)))]
+
+setkey(genes, chr, start, end)
+
+# Control_vs_5aza
+
+dt_ctl_5aza <- fread(paste0(out_prefix, "_Control_vs_5aza_sigCpGs.tsv")) #Read DMS file
+
+dt_ctl_5aza[, `:=`(chr = as.character(chr), pos = as.integer(pos),
+                   cpg_start = as.integer(pos), cpg_end = as.integer(pos))]
+
+setkey(dt_ctl_5aza, chr, cpg_start, cpg_end)
+
+dt_ctl_5aza_withGenes <- foverlaps(
+  dt_ctl_5aza, genes,
+  by.x = c("chr","cpg_start","cpg_end"),
+  by.y = c("chr","start","end"),
+  type = "within",
+  nomatch = NA)
+
+fwrite(dt_ctl_5aza_withGenes,paste0(out_prefix, "_Control_vs_5aza_sigCpGs_withGenes.tsv"),sep="\t") #Write Results
+
+# Control_vs_6aza
+
+dt_ctl_6aza <- fread(paste0(out_prefix, "_Control_vs_6aza_sigCpGs.tsv")) #Read DMS file
+
+dt_ctl_6aza[, `:=`(chr = as.character(chr), pos = as.integer(pos),
+                   cpg_start = as.integer(pos), cpg_end = as.integer(pos))]
+
+setkey(dt_ctl_6aza, chr, cpg_start, cpg_end)
+
+dt_ctl_6aza_withGenes <- foverlaps(dt_ctl_6aza, genes,
+  by.x = c("chr","cpg_start","cpg_end"),
+  by.y = c("chr","start","end"),
+  type = "within",
+  nomatch = NA)
+
+fwrite(dt_ctl_6aza_withGenes,paste0(out_prefix, "_Control_vs_6aza_sigCpGs_withGenes.tsv"),sep="\t") #Write Results
+
+#5aza_vs_6aza
+
+dt_5aza_6aza <- fread(paste0(out_prefix, "_5aza_vs_6aza_sigCpGs.tsv"))
+
+dt_5aza_6aza[, `:=`(chr = as.character(chr), pos = as.integer(pos),
+                    cpg_start = as.integer(pos), cpg_end = as.integer(pos))]
+
+setkey(dt_5aza_6aza, chr, cpg_start, cpg_end)
+
+dt_5aza_6aza_withGenes <- foverlaps(dt_5aza_6aza, genes,
+  by.x = c("chr","cpg_start","cpg_end"),
+  by.y = c("chr","start","end"),
+  type = "within",
+  nomatch = NA)
+
+fwrite(dt_5aza_6aza_withGenes,paste0(out_prefix, "_5aza_vs_6aza_sigCpGs_withGenes.tsv"), sep="\t") #Write Results
+
+#repro_vs_sterile
+
+dt_repro <- fread(paste0(out_prefix, "_repro_vs_sterile_sigCpGs.tsv"))
+
+dt_repro[, `:=`(chr = as.character(chr), pos = as.integer(pos), cpg_start = as.integer(pos), cpg_end = as.integer(pos))]
+
+setkey(dt_repro, chr, cpg_start, cpg_end)
+
+dt_repro_withGenes <- foverlaps(dt_repro, genes,
+  by.x = c("chr","cpg_start","cpg_end"),
+  by.y = c("chr","start","end"),
+  type = "within",
+  nomatch = NA)
+
+fwrite(dt_repro_withGenes,paste0(out_prefix, "_repro_vs_sterile_sigCpGs_withGenes.tsv"), sep="\t") #Write Results
+
+# Colony_effect
+
+dt_colony <- fread(paste0(out_prefix, "_Colony_effect_sigCpGs.tsv")) #Read DMS file
+
+dt_colony[, `:=`(chr = as.character(chr), pos = as.integer(pos),
+                 cpg_start = as.integer(pos), cpg_end = as.integer(pos))]
+
+setkey(dt_colony, chr, cpg_start, cpg_end)
+
+dt_colony_withGenes <- foverlaps(dt_colony, genes,
+  by.x = c("chr","cpg_start","cpg_end"),
+  by.y = c("chr","start","end"),
+  type = "within",
+  nomatch = NA)
+
+fwrite(dt_colony_withGenes,paste0(out_prefix, "_Colony_effect_sigCpGs_withGenes.tsv"),sep = "\t") #Write Results
+
+################################ GO Enrichment: Biological Process ################################
+
+go_map <- fread(go_map_file, sep = "\t", header = FALSE)
+setnames(go_map, c("geneID", "GO", "Aspect"))
+go_map <- unique(go_map)
+
+gene2go_BP <- lapply(
+  split(go_map[Aspect == "P"]$GO, go_map[Aspect == "P"]$geneID),
+  unique
+)
+
+universe_BP <- names(gene2go_BP)
+
+cat("BP GO universe:", length(universe_BP), "genes\n")
+
+# Control_vs_5aza
+
+dt <- fread(paste0(out_prefix, "_Control_vs_5aza_sigCpGs_withGenes.tsv")) #Read File
+
+sig_genes <- unique(dt[!is.na(geneID) & geneID != "", geneID])
+sig_genes_use <- intersect(sig_genes, universe_BP)
+geneList <- factor(as.integer(universe_BP %in% sig_genes_use))
+names(geneList) <- universe_BP
+
+GOdata <- new("topGOdata", ontology="BP", allGenes=geneList,
+              annot=annFUN.gene2GO, gene2GO=gene2go_BP, nodeSize=nodeSize)
+
+res_classic <- runTest(GOdata, algorithm="classic", statistic="fisher")
+res_elim    <- runTest(GOdata, algorithm="elim",    statistic="fisher")
+
+tab <- GenTable(GOdata, classicFisher=res_classic, elimFisher=res_elim,
+                orderBy="elimFisher", ranksOf="classicFisher", topNodes = length(score(res_elim)))
+
+tab <- as.data.table(tab)
+tab[, elimFisher_numeric := as.numeric(sub("^<\\s*", "", elimFisher))]
+tab <- tab[!is.na(elimFisher_numeric) & elimFisher_numeric < 0.05]
+fwrite(as.data.table(tab), paste0(out_prefix, "_topGO_Control_vs_5aza_BP.tsv"), sep="\t")
+
+# Control_vs_6aza
+
+dt <- fread(paste0(out_prefix, "_Control_vs_6aza_sigCpGs_withGenes.tsv"))
+
+sig_genes <- unique(dt[!is.na(geneID) & geneID != "", geneID])
+sig_genes_use <- intersect(sig_genes, universe_BP)
+geneList <- factor(as.integer(universe_BP %in% sig_genes_use))
+names(geneList) <- universe_BP
+
+GOdata <- new("topGOdata", ontology="BP", allGenes=geneList,
+              annot=annFUN.gene2GO, gene2GO=gene2go_BP, nodeSize=nodeSize)
+
+res_classic <- runTest(GOdata, algorithm="classic", statistic="fisher")
+res_elim    <- runTest(GOdata, algorithm="elim",    statistic="fisher")
+
+tab <- GenTable(GOdata, classicFisher=res_classic, elimFisher=res_elim,
+                orderBy="elimFisher", ranksOf="classicFisher", topNodes = length(score(res_elim)))
+
+tab <- as.data.table(tab)
+
+tab[, elimFisher_numeric := as.numeric(sub("^<\\s*", "", elimFisher))]
+tab <- tab[!is.na(elimFisher_numeric) & elimFisher_numeric < 0.05] 
+
+fwrite(as.data.table(tab), paste0(out_prefix, "_topGO_Control_vs_6aza_BP.tsv"), sep="\t")
+
+# 5aza_vs_6aza
+
+dt <- fread(paste0(out_prefix, "_5aza_vs_6aza_sigCpGs_withGenes.tsv"))
+
+sig_genes <- unique(dt[!is.na(geneID) & geneID != "", geneID])
+sig_genes_use <- intersect(sig_genes, universe_BP)
+
+geneList <- factor(as.integer(universe_BP %in% sig_genes_use))
+
+names(geneList) <- universe_BP
+
+GOdata <- new("topGOdata", ontology="BP", allGenes=geneList,
+              annot=annFUN.gene2GO, gene2GO=gene2go_BP, nodeSize=nodeSize)
+
+res_classic <- runTest(GOdata, algorithm="classic", statistic="fisher")
+res_elim    <- runTest(GOdata, algorithm="elim",    statistic="fisher")
+
+tab <- GenTable(GOdata, classicFisher=res_classic, elimFisher=res_elim,
+                orderBy="elimFisher", ranksOf="classicFisher", topNodes = length(score(res_elim)))
+
+tab <- as.data.table(tab)
+tab[, elimFisher_numeric := as.numeric(sub("^<\\s*", "", elimFisher))]
+tab <- tab[!is.na(elimFisher_numeric) & elimFisher_numeric < 0.05] 
+
+fwrite(as.data.table(tab), paste0(out_prefix, "_topGO_5aza_vs_6aza_BP.tsv"), sep="\t")
+
+# repro_vs_sterile
+
+dt <- fread(paste0(out_prefix, "_repro_vs_sterile_sigCpGs_withGenes.tsv"))
+
+sig_genes <- unique(dt[!is.na(geneID) & geneID != "", geneID])
+sig_genes_use <- intersect(sig_genes, universe_BP)
+
+geneList <- factor(as.integer(universe_BP %in% sig_genes_use))
+names(geneList) <- universe_BP
+
+GOdata <- new("topGOdata", ontology="BP", allGenes=geneList,
+              annot=annFUN.gene2GO, gene2GO=gene2go_BP, nodeSize=nodeSize)
+
+res_classic <- runTest(GOdata, algorithm="classic", statistic="fisher")
+res_elim    <- runTest(GOdata, algorithm="elim",    statistic="fisher")
+
+tab <- GenTable(GOdata, classicFisher=res_classic, elimFisher=res_elim,
+                orderBy="elimFisher", ranksOf="classicFisher", topNodes = length(score(res_elim)))
+
+tab <- as.data.table(tab)
+tab[, elimFisher_numeric := as.numeric(sub("^<\\s*", "", elimFisher))]
+tab <- tab[!is.na(elimFisher_numeric) & elimFisher_numeric < 0.05] 
+
+fwrite(as.data.table(tab), paste0(out_prefix, "_topGO_repro_vs_sterile_BP.tsv"), sep="\t")
+
+
+# Colony_effect
+
+dt <- fread(paste0(out_prefix, "_Colony_effect_sigCpGs_withGenes.tsv"))
+
+sig_genes <- unique(dt[!is.na(geneID) & geneID != "", geneID])
+sig_genes_use <- intersect(sig_genes, universe_BP)
+
+geneList <- factor(as.integer(universe_BP %in% sig_genes_use))
+names(geneList) <- universe_BP
+
+GOdata <- new("topGOdata", ontology="BP", allGenes=geneList,
+              annot=annFUN.gene2GO, gene2GO=gene2go_BP, nodeSize=nodeSize)
+
+res_classic <- runTest(GOdata, algorithm="classic", statistic="fisher")
+res_elim    <- runTest(GOdata, algorithm="elim",    statistic="fisher")
+
+tab <- GenTable(GOdata, classicFisher=res_classic, elimFisher=res_elim,
+                orderBy="elimFisher", ranksOf="classicFisher", topNodes = length(score(res_elim)))
+
+tab <- as.data.table(tab)
+tab[, elimFisher_numeric := as.numeric(sub("^<\\s*", "", elimFisher))]
+tab <- tab[!is.na(elimFisher_numeric) & elimFisher_numeric < 0.05] 
+
+fwrite(as.data.table(tab), paste0(out_prefix, "_topGO_Colony_effect_BP.tsv"), sep="\t")
+
+################################ BP GO Treemaps ################################
+
+# Control_vs_5aza
+
+terms_to_plot <- fread(paste0(out_prefix, "_topGO_Control_vs_5aza_BP.tsv"))
+
+if (nrow(terms_to_plot) > 0) {
+  
+  simMatrix <- calculateSimMatrix(
+    terms_to_plot$GO.ID,
+    orgdb = treemap_orgdb,
+    ont = "BP",
+    method = "Rel")
+  
+  scores <- setNames(
+    -log10(pmax(
+      terms_to_plot$elimFisher_numeric,
+      .Machine$double.xmin)),
+    terms_to_plot$GO.ID)
+  
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores,
+    threshold = 0.7,
+    orgdb = treemap_orgdb)
+  
+  png(paste0(out_prefix, "_Control_vs_5aza_BP_GO_treemap.png"),width = 1200,height = 800)
+  
+  treemapPlot(reducedTerms)
+  dev.off()
+  
+  fwrite(as.data.table(reducedTerms, keep.rownames = "GO.ID"),
+    paste0(out_prefix, "_Control_vs_5aza_BP_GO_reduced_terms.tsv"),
+    sep = "\t")}
+
+# Control_vs_6aza
+
+terms_to_plot <- fread(paste0(out_prefix, "_topGO_Control_vs_6aza_BP.tsv"))
+
+if (nrow(terms_to_plot) > 0) {
+  
+  simMatrix <- calculateSimMatrix(
+    terms_to_plot$GO.ID,
+    orgdb = treemap_orgdb,
+    ont = "BP",
+    method = "Rel")
+  
+  scores <- setNames(
+    -log10(pmax(
+      terms_to_plot$elimFisher_numeric,
+      .Machine$double.xmin)),
+    terms_to_plot$GO.ID)
+  
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores,
+    threshold = 0.7,
+    orgdb = treemap_orgdb)
+  
+  png(paste0(out_prefix, "_Control_vs_6aza_BP_GO_treemap.png"),width = 1200,height = 800)
+  treemapPlot(reducedTerms)
+  dev.off()
+  
+  fwrite(as.data.table(reducedTerms, keep.rownames = "GO.ID"),
+    paste0(out_prefix, "_Control_vs_6aza_BP_GO_reduced_terms.tsv"),
+    sep = "\t")}
+
+# 5aza_vs_6aza
+
+terms_to_plot <- fread(paste0(out_prefix, "_topGO_5aza_vs_6aza_BP.tsv"))
+
+if (nrow(terms_to_plot) > 0) {
+  
+  simMatrix <- calculateSimMatrix(
+    terms_to_plot$GO.ID,
+    orgdb = treemap_orgdb,
+    ont = "BP",
+    method = "Rel")
+  
+  scores <- setNames(
+    -log10(pmax(
+      terms_to_plot$elimFisher_numeric,
+      .Machine$double.xmin)),
+    terms_to_plot$GO.ID)
+  
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores,
+    threshold = 0.7,
+    orgdb = treemap_orgdb)
+  
+  png(paste0(out_prefix, "_5aza_vs_6aza_BP_GO_treemap.png"),
+    width = 1200,
+    height = 800)
+  
+  treemapPlot(reducedTerms)
+  dev.off()
+  
+  fwrite(as.data.table(reducedTerms, keep.rownames = "GO.ID"),
+    paste0(out_prefix, "_5aza_vs_6aza_BP_GO_reduced_terms.tsv"),
+    sep = "\t")}
+
+# repro_vs_sterile
+
+terms_to_plot <- fread(paste0(out_prefix, "_topGO_repro_vs_sterile_BP.tsv"))
+
+if (nrow(terms_to_plot) > 0) {
+  
+  simMatrix <- calculateSimMatrix(
+    terms_to_plot$GO.ID,
+    orgdb = treemap_orgdb,
+    ont = "BP",
+    method = "Rel")
+  
+  scores <- setNames(
+    -log10(pmax(
+      terms_to_plot$elimFisher_numeric,
+      .Machine$double.xmin)),
+    terms_to_plot$GO.ID)
+  
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores,
+    threshold = 0.7,
+    orgdb = treemap_orgdb)
+  
+  png(paste0(out_prefix, "_repro_vs_sterile_BP_GO_treemap.png"),
+    width = 1200,
+    height = 800)
+  
+  treemapPlot(reducedTerms)
+  dev.off()
+  
+  fwrite(as.data.table(reducedTerms, keep.rownames = "GO.ID"),
+    paste0(out_prefix, "_repro_vs_sterile_BP_GO_reduced_terms.tsv"),
+    sep = "\t")}
+
+# Colony_effect
+
+terms_to_plot <- fread(paste0(out_prefix, "_topGO_Colony_effect_BP.tsv"))
+
+if (nrow(terms_to_plot) > 0) {
+  simMatrix <- calculateSimMatrix(
+    terms_to_plot$GO.ID,
+    orgdb = treemap_orgdb,
+    ont = "BP",
+    method = "Rel")
+  
+  scores <- setNames(
+    -log10(pmax(
+      terms_to_plot$elimFisher_numeric,
+      .Machine$double.xmin)),
+    terms_to_plot$GO.ID)
+  
+  reducedTerms <- reduceSimMatrix(
+    simMatrix,
+    scores,
+    threshold = 0.7,
+    orgdb = treemap_orgdb)
+  
+  png(paste0(out_prefix, "_Colony_effect_BP_GO_treemap.png"),
+    width = 1200,
+    height = 800)
+  
+  treemapPlot(reducedTerms)
+  dev.off()
+  
+  fwrite(as.data.table(reducedTerms, keep.rownames = "GO.ID"),
+    paste0(out_prefix, "_Colony_effect_BP_GO_reduced_terms.tsv"),
+    sep = "\t")}
+
+################################ BP GO UpSet Plot ################################
+
+go_sets <- list(
+  "Control vs decitabine" = unique(na.omit(
+    fread(paste0(out_prefix, "_topGO_Control_vs_5aza_BP.tsv"))$GO.ID
+  )),
+  "Control vs 6-azacytidine" = unique(na.omit(
+    fread(paste0(out_prefix, "_topGO_Control_vs_6aza_BP.tsv"))$GO.ID
+  )),
+  "Decitabine vs 6-azacytidine" = unique(na.omit(
+    fread(paste0(out_prefix, "_topGO_5aza_vs_6aza_BP.tsv"))$GO.ID
+  )),
+  "Reproductive vs sterile" = unique(na.omit(
+    fread(paste0(out_prefix, "_topGO_repro_vs_sterile_BP.tsv"))$GO.ID
+  )),
+  "Colony effect" = unique(na.omit(
+    fread(paste0(out_prefix, "_topGO_Colony_effect_BP.tsv"))$GO.ID
+  ))
+)
+
+upset_input <- UpSetR::fromList(go_sets)
+
+png(
+  paste0(out_prefix, "_BP_GO_UpSet_plot.png"),
+  width = 4200,
+  height = 2800,
+  res = 300
+)
+
+upset_plot <- UpSetR::upset(
+  upset_input,
+  sets = rev(names(go_sets)),
+  keep.order = TRUE,
+  nsets = length(go_sets),
+  nintersects = NA,
+  order.by = c("freq", "degree"),
+  decreasing = c(TRUE, FALSE),
+  mainbar.y.label = "Number of BP GO terms",
+  sets.x.label = "Total BP GO terms",
+  text.scale = c(1.4, 1.4, 1.2, 1.1, 1.8, 1.2),
+  point.size = 3.5,
+  line.size = 1.2,
+  mb.ratio = c(0.65, 0.35)
+)
+
+print(upset_plot)
+dev.off()
+
+################################ Permutation Test ################################
+library(data.table)
+library(topGO)
+library(GO.db)
+library(ggplot2)
+
+base_path <- "."
+
+# Fixed (never permuted) BP term-set TSVs, already produced by DSS.R
+
+deci_bp_file  <- file.path(base_path, paste0(out_prefix, "_topGO_Control_vs_5aza_BP.tsv"))
+six_bp_file   <- file.path(base_path, paste0(out_prefix, "_topGO_Control_vs_6aza_BP.tsv"))
+repro_bp_file <- file.path(base_path, paste0(out_prefix, "_topGO_repro_vs_sterile_BP.tsv"))
+
+#Parameters
+go_p_thresh <- 0.05  # elimFisher threshold used to define an "enriched" BP term, matches DSS.R
+n_perm <- 2000         # timing pilot; increase after checking runtime and validation
+out_dir <- file.path(base_path, paste0("Permutation_", n_perm))
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+seed   <- 1
+
+#Threading
+
+use_parallel <- TRUE   # set TRUE and install/load `parallel` if you want to speed this up;
+n_cores <- 4             # see PART 5 for the swap-in
+
+## ---- 1.2: fixed Decitabine / 6-aza BP term sets (never permuted) ----
+
+go_deci_bp  <- unique(na.omit(fread(deci_bp_file)$GO.ID))
+
+go_six_bp   <- unique(na.omit(fread(six_bp_file)$GO.ID))
+
+go_repro_bp_real <- unique(na.omit(fread(repro_bp_file)$GO.ID))   # the REAL, published repro term set
+
+cat(sprintf("Fixed sets: Decitabine BP terms = %d, 6-aza BP terms = %d, real repro BP terms = %d\n",
+            
+            length(go_deci_bp), length(go_six_bp), length(go_repro_bp_real)))
+
+# Full repro_vs_sterile CpG results
+
+dms_repro_full <- copy(dms_repro_dt)
+
+dms_repro_full[, `:=`(
+  chr = as.character(chr),
+  pos = as.integer(pos))]
+
+testable_cpgs <- dms_repro_full[!is.na(fdr)]
+
+n_sig_real <- testable_cpgs[
+  fdr < fdr_thresh,.N]
+
+################################ Permutation Functions ################################
+
+# Map CpGs to genes
+map_cpgs_to_genes <- function(cpg_dt, genes_dt) {
+  
+  d <- copy(cpg_dt)
+  d[, `:=`(cpg_start = pos, cpg_end = pos)]
+  setkey(d, chr, cpg_start, cpg_end)
+  
+  withGenes <- foverlaps(
+    d,
+    genes_dt,
+    by.x = c("chr", "cpg_start", "cpg_end"),
+    by.y = c("chr", "start", "end"),
+    type = "within",
+    nomatch = NA)
+  
+  unique(withGenes[!is.na(geneID) & geneID != "",
+    geneID])}
+
+
+# Run BP topGO enrichment for each permutation
+run_topgo_bp_fast <- function(
+    sig_genes,
+    universe_BP,
+    gene2go_BP,
+    nodeSize,
+    p_thresh
+) {
+  
+  sig_genes_use <- intersect(sig_genes, universe_BP)
+  geneList <- factor(as.integer(universe_BP %in% sig_genes_use))
+  
+  names(geneList) <- universe_BP
+  
+  GOdata <- new(
+    "topGOdata",
+    ontology = "BP",
+    allGenes = geneList,
+    annot = annFUN.gene2GO,
+    gene2GO = gene2go_BP,
+    nodeSize = nodeSize)
+  
+  res_elim <- runTest(
+    GOdata, algorithm = "elim",
+    statistic = "fisher")
+  
+  p_elim <- score(res_elim)
+  
+  names(p_elim)[p_elim < p_thresh]}
+
+# Compare reproductive-status overlap with the two drug term sets
+overlap_stat <- function(repro_terms, deci_terms, six_terms) {
+  
+  b <- length(intersect(
+    setdiff(deci_terms, six_terms),
+    repro_terms))
+  
+  c <- length(intersect(
+    setdiff(six_terms, deci_terms),
+    repro_terms))
+  
+  a <- length(intersect(
+    intersect(deci_terms, six_terms),
+    repro_terms))
+  
+  list(b = b, c = c,a = a,
+    diff = b - c)}
+
+################################ Observed GO Overlap ################################
+
+obs <- overlap_stat(go_repro_bp_real, go_deci_bp, go_six_bp)
+
+################################ Permutation Loop ################################
+
+RNGkind("L'Ecuyer-CMRG")
+set.seed(seed)
+
+one_replicate <- function(i) {
+  perm_idx <- sample(
+    nrow(testable_cpgs),
+    n_sig_real,
+    replace = FALSE)
+  
+  perm_cpgs <- testable_cpgs[perm_idx,.(chr, pos)]
+  perm_genes <- map_cpgs_to_genes(perm_cpgs,genes)
+  
+  perm_terms <- run_topgo_bp_fast(perm_genes,
+    universe_BP,gene2go_BP,
+    nodeSize,
+    go_p_thresh)
+  
+  s <- overlap_stat(
+    perm_terms,
+    go_deci_bp,
+    go_six_bp)
+  
+  c(b = s$b,c = s$c,a = s$a,
+    diff = s$diff,
+    n_terms = length(perm_terms))}
+
+perm_results <- parallel::mclapply(
+  seq_len(n_perm),
+  one_replicate,
+  mc.cores = n_cores,
+  mc.set.seed = TRUE)
+
+perm_results <- as.data.table(do.call(rbind, perm_results))
+
+fwrite(perm_results,
+  file.path(out_dir,
+    "5aza_vs_6aza_repro_BP_permutation_null.csv"))
+
+################################ Empirical P-values ################################
+
+null_center <- mean(perm_results$diff)
+
+p_two_sided <- (sum(
+    abs(perm_results$diff - null_center) >=
+      abs(obs$diff - null_center)) + 1) / (n_perm + 1)
+
+p_one_sided <- (sum(perm_results$diff >= obs$diff) + 1) / (n_perm + 1)
+
+summary_out <- data.table(n_perm = n_perm,
+  observed_b = obs$b,
+  observed_c = obs$c,
+  observed_diff = obs$diff,
+  null_mean_diff = null_center,
+  null_sd_diff = sd(perm_results$diff),
+  p_two_sided = p_two_sided,
+  p_one_sided = p_one_sided)
+
+fwrite(summary_out,file.path(out_dir,"5aza_vs_6aza_repro_BP_permutation_summary.csv"))
+print(summary_out)
+
+################################ Permutation Null Distribution ################################
+
+p_null <- ggplot(perm_results, aes(x = diff)) +
+  geom_histogram(
+    binwidth = 1,
+    fill = "grey75",
+    colour = "white") +
+  geom_vline(
+    xintercept = obs$diff,
+    colour = "black",
+    linewidth = 1.1,
+    linetype = "dashed") +
+  annotate(
+    "text",
+    x = obs$diff,
+    y = Inf,
+    vjust = 1.5,
+    hjust = -0.1,
+    label = sprintf(
+      "Observed = %d\nTwo-sided P = %.4f",
+      obs$diff,
+      p_two_sided),
+    size = 3.5) +
+  labs(x = "5-aza-only minus 6-aza-only reproductive-overlap BP terms",
+    y = "Permutation replicates",
+    title = "Permutation null distribution") +
+  theme_classic(base_size = 12)
+
+ggsave(file.path(out_dir,"5aza_vs_6aza_repro_BP_permutation_null.pdf"),
+  p_null,width = 7,height = 5)
