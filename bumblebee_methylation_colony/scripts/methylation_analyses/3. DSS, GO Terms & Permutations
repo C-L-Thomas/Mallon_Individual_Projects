@@ -84,7 +84,6 @@ samples <- lapply(file.list, function(input_file) {
   message("Reading: ", basename(input_file))
   
   dat <- fread(input_file)
-  setnames(dat, c("C", "total"), c("X", "N"))
   
   dat <- dat[, .(
     chr = as.character(chr),
@@ -124,6 +123,20 @@ cat("=================================================\n\n")
 ################################ PCA ################################
 
 meth <- getMeth(BSobj, type = "raw")
+
+# Treat zero-coverage observations as missing
+meth[getCoverage(BSobj, type = "Cov") == 0] <- NA_real_
+
+# Extract CpG coordinates
+cpg_coords <- data.table(chr = as.character(seqnames(BSobj)),pos = start(BSobj))
+head(cpg_coords)
+
+#Export full methylation database
+meth_export <- as.data.table(meth * 100) # Convert methylation proportions to percentages
+setnames(meth_export, metadata$Sample_name) # Assign sample names
+meth_export <- cbind(cpg_coords, meth_export) # Add CpG coordinates
+fwrite(meth_export, paste0(out_prefix, "_All_CpG_methylation.tsv"), sep="\t", na="NA") #Write results
+rm(meth_export) #Free memory
 
 # Retain complete, variable CpGs
 meth_filt <- meth[complete.cases(meth), , drop = FALSE]
@@ -186,8 +199,14 @@ dms_repro_dt <- as.data.table(dms_repro)
 setnames(dms_repro_dt, "fdrs", "fdr")
 dms_repro_sig <- dms_repro_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites 
 dms_repro_sig[, contrast := "repro_vs_sterile"]
+repro_means <- copy(cpg_coords) # Calculate mean methylation percentages
+repro_means[, mean_repro := 100 * rowMeans(meth[, designA$Status == "repro", drop = FALSE],na.rm = TRUE)]
+repro_means[, mean_sterile := 100 * rowMeans(meth[, designA$Status == "sterile", drop = FALSE],na.rm = TRUE)]
+repro_means[is.nan(mean_repro), mean_repro := NA_real_] # Convert missing group means to NA
+repro_means[is.nan(mean_sterile), mean_sterile := NA_real_]
+repro_means[, meth_diff := mean_repro - mean_sterile] # Calculate methylation difference
+dms_repro_sig <- merge(dms_repro_sig, repro_means, by = c("chr", "pos"),all.x = TRUE,sort = FALSE) # Merge with significant CpGs
 fwrite(dms_repro_sig, paste0(out_prefix, "_repro_vs_sterile_sigCpGs.tsv"), sep="\t") #Write results
-
 
 #Control vs 6aza
 dms_6aza_ctl <- DMLtest.multiFactor(fitA, coef="Drug6aza") #Perform Wald tests
@@ -196,6 +215,13 @@ setnames(dms_6aza_ctl_dt, "fdrs", "fdr")
 dms_6aza_ctl_dt[, stat := -stat] # Convert 6aza - Control to Control - 6aza
 dms_ctl_6aza_sig <- dms_6aza_ctl_dt[!is.na(fdr) & fdr < fdr_thresh]
 dms_ctl_6aza_sig[, contrast := "Control_vs_6aza"]
+ctl_6aza_means <- copy(cpg_coords) # Calculate mean methylation percentages
+ctl_6aza_means[, mean_Control := 100 * rowMeans(meth[, designA$Drug == "Control", drop = FALSE],na.rm = TRUE)]
+ctl_6aza_means[, mean_6aza := 100 * rowMeans(meth[, designA$Drug == "6aza", drop = FALSE],na.rm = TRUE)]
+ctl_6aza_means[is.nan(mean_Control), mean_Control := NA_real_] # Convert missing group means to NA
+ctl_6aza_means[is.nan(mean_6aza), mean_6aza := NA_real_]
+ctl_6aza_means[, meth_diff := mean_Control - mean_6aza] # Calculate methylation difference
+dms_ctl_6aza_sig <- merge(dms_ctl_6aza_sig, ctl_6aza_means, by = c("chr", "pos"),all.x = TRUE,sort = FALSE) # Merge with significant CpGs
 fwrite(dms_ctl_6aza_sig, paste0(out_prefix, "_Control_vs_6aza_sigCpGs.tsv"), sep="\t") #Write results
 
 #Colony
@@ -205,6 +231,32 @@ setnames(dms_colony_dt, "pvals", "pval")
 dms_colony_dt[, fdr := p.adjust(pval, method = "BH")] #Need to perform fdr because of multi-degree freedom wald test
 dms_colony_sig <- dms_colony_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites
 dms_colony_sig[, contrast := "Colony_effect"]
+
+colony_means <- copy(cpg_coords) # Calculate mean methylation percentages
+colony_means[, mean_colony_1 := 100 * rowMeans(meth[, designA$Colony == "1", drop = FALSE],na.rm = TRUE)]
+colony_means[, mean_colony_3 := 100 * rowMeans(meth[, designA$Colony == "3", drop = FALSE],na.rm = TRUE)]
+colony_means[, mean_colony_4 := 100 * rowMeans(meth[, designA$Colony == "4", drop = FALSE],na.rm = TRUE)]
+colony_means[, mean_colony_6 := 100 * rowMeans(meth[, designA$Colony == "6", drop = FALSE],na.rm = TRUE)]
+colony_means[, mean_colony_7 := 100 * rowMeans(meth[, designA$Colony == "7", drop = FALSE],na.rm = TRUE)]
+colony_means[, mean_colony_8 := 100 * rowMeans(meth[, designA$Colony == "8", drop = FALSE],na.rm = TRUE)]
+
+colony_means[is.nan(mean_colony_1), mean_colony_1 := NA_real_] # Convert missing group means to NA
+colony_means[is.nan(mean_colony_3), mean_colony_3 := NA_real_]
+colony_means[is.nan(mean_colony_4), mean_colony_4 := NA_real_]
+colony_means[is.nan(mean_colony_6), mean_colony_6 := NA_real_]
+colony_means[is.nan(mean_colony_7), mean_colony_7 := NA_real_]
+colony_means[is.nan(mean_colony_8), mean_colony_8 := NA_real_]
+
+dms_colony_sig <- merge(dms_colony_sig, colony_means, by = c("chr", "pos"),all.x = TRUE,sort = FALSE) # Merge with significant CpGs
+
+dms_colony_sig[, max_meth_diff :=  # Calculate maximum methylation difference between colonies
+  pmax(mean_colony_1, mean_colony_3, mean_colony_4, mean_colony_6, mean_colony_7, mean_colony_8, na.rm = TRUE) -
+  pmin(mean_colony_1, mean_colony_3, mean_colony_4, mean_colony_6, mean_colony_7, mean_colony_8, na.rm = TRUE)]
+
+colony_cols <- c("mean_colony_1", "mean_colony_3", "mean_colony_4", "mean_colony_6", "mean_colony_7", "mean_colony_8")
+n_colonies <- rowSums(!is.na(dms_colony_sig[, ..colony_cols]))
+dms_colony_sig[n_colonies < 2, max_meth_diff := NA_real_] # Require methylation data from at least two colonies
+
 fwrite(dms_colony_sig, paste0(out_prefix, "_Colony_effect_sigCpGs.tsv"), sep = "\t") #Write results
 
 
@@ -219,6 +271,13 @@ dms_ctl_5aza_dt <- as.data.table(dms_ctl_5aza)
 setnames(dms_ctl_5aza_dt, "fdrs", "fdr")
 dms_ctl_5aza_sig <- dms_ctl_5aza_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites
 dms_ctl_5aza_sig[, contrast := "Control_vs_5aza"]
+ctl_5aza_means <- copy(cpg_coords) # Calculate mean methylation percentages
+ctl_5aza_means[, mean_Control := 100 * rowMeans(meth[, designB$Drug == "Control", drop = FALSE],na.rm = TRUE)]
+ctl_5aza_means[, mean_5aza := 100 * rowMeans(meth[, designB$Drug == "5aza", drop = FALSE],na.rm = TRUE)]
+ctl_5aza_means[is.nan(mean_Control), mean_Control := NA_real_] # Convert missing group means to NA
+ctl_5aza_means[is.nan(mean_5aza), mean_5aza := NA_real_]
+ctl_5aza_means[, meth_diff := mean_Control - mean_5aza] # Calculate methylation difference
+dms_ctl_5aza_sig <- merge(dms_ctl_5aza_sig, ctl_5aza_means, by = c("chr", "pos"),all.x = TRUE,sort = FALSE) # Merge with significant CpGs
 fwrite(dms_ctl_5aza_sig, paste0(out_prefix, "_Control_vs_5aza_sigCpGs.tsv"), sep="\t") #Write results
 
 #  6aza vs 5aza
@@ -228,8 +287,14 @@ setnames(dms_6aza_5aza_dt, "fdrs", "fdr")
 dms_6aza_5aza_dt[, stat := -stat] # Convert 6aza - 5aza to 5aza - 6aza
 dms_5aza_6aza_sig <- dms_6aza_5aza_dt[!is.na(fdr) & fdr < fdr_thresh] #Select significant sites
 dms_5aza_6aza_sig[, contrast := "5aza_vs_6aza"]
+five_six_means <- copy(cpg_coords) # Calculate mean methylation percentages
+five_six_means[, mean_5aza := 100 * rowMeans(meth[, designB$Drug == "5aza", drop = FALSE],na.rm = TRUE)]
+five_six_means[, mean_6aza := 100 * rowMeans(meth[, designB$Drug == "6aza", drop = FALSE],na.rm = TRUE)]
+five_six_means[is.nan(mean_5aza), mean_5aza := NA_real_] # Convert missing group means to NA
+five_six_means[is.nan(mean_6aza), mean_6aza := NA_real_]
+five_six_means[, meth_diff := mean_5aza - mean_6aza] # Calculate methylation difference
+dms_5aza_6aza_sig <- merge(dms_5aza_6aza_sig, five_six_means, by = c("chr", "pos"),all.x = TRUE,sort = FALSE) # Merge with significant CpGs
 fwrite(dms_5aza_6aza_sig, paste0(out_prefix, "_5aza_vs_6aza_sigCpGs.tsv"), sep="\t") #Write results
-cat("[5aza_vs_6aza] sig CpGs:", nrow(dms_5aza_6aza_sig), "\n")
 
 saveRDS(dms_repro_dt, file = "dms_repro_dt.rds")
 saveRDS(dms_6aza_ctl_dt, file = "dms_ctl_6aza_dt.rds")
